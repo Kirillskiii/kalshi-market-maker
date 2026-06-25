@@ -40,4 +40,5 @@ def create_market_maker(mm_config: Dict, api, logger, risk_config: Dict | None =
         max_contracts_per_market=risk_config.get("max_contracts_per_market"),
         reserve_contracts_buffer=risk_config.get("reserve_contracts_buffer", 0),
         shared_risk_state=shared_risk_state,
+        target_order_dollars=mm_config.get("target_order_dollars"),
     )

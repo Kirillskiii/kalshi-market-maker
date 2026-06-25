@@ -133,7 +133,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
         total_position = 0
         for position in positions:
             if position["ticker"] == self.market_ticker:
-                total_position += position["position"]
+                pos = position.get("position", position.get("position_fp", 0))
+                total_position += int(float(pos))
 
         return total_position
 
@@ -141,13 +142,21 @@ class KalshiTradingAPI(AbstractTradingAPI):
         path = f"/markets/{self.market_ticker}"
         data = self.make_request("GET", path)
 
-        yes_bid = float(data["market"]["yes_bid"]) / 100
-        yes_ask = float(data["market"]["yes_ask"]) / 100
-        no_bid = float(data["market"]["no_bid"]) / 100
-        no_ask = float(data["market"]["no_ask"]) / 100
+        market = data["market"]
+        # API returns *_dollars fields (0.0–1.0); fall back to integer-cent *_bid/*_ask
+        if "yes_bid_dollars" in market:
+            yes_bid = float(market["yes_bid_dollars"])
+            yes_ask = float(market["yes_ask_dollars"])
+            no_bid = float(market["no_bid_dollars"])
+            no_ask = float(market["no_ask_dollars"])
+        else:
+            yes_bid = float(market["yes_bid"]) / 100
+            yes_ask = float(market["yes_ask"]) / 100
+            no_bid = float(market["no_bid"]) / 100
+            no_ask = float(market["no_ask"]) / 100
 
-        yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
-        no_mid_price = round((no_bid + no_ask) / 2, 2)
+        yes_mid_price = round((yes_bid + yes_ask) / 2, 4)
+        no_mid_price = round((no_bid + no_ask) / 2, 4)
 
         return {"yes": yes_mid_price, "no": no_mid_price}
 
@@ -170,26 +179,29 @@ class KalshiTradingAPI(AbstractTradingAPI):
         quantity: int,
         expiration_ts: int = None,
     ) -> str:
-        path = "/portfolio/orders"
+        # v2 order endpoint: bid/ask on yes-price in fixed-point dollars
+        # buy yes  → bid, sell yes → ask
+        # buy no   → ask (buying no = selling yes), sell no → bid
+        path = "/portfolio/events/orders"
+        if side == "yes":
+            v2_side = "bid" if action.lower() == "buy" else "ask"
+        else:
+            v2_side = "ask" if action.lower() == "buy" else "bid"
+            price = 1.0 - price  # convert no-price to yes-price
+
         data = {
             "ticker": ticker,
-            "action": action.lower(),
-            "type": "limit",
-            "side": side,
-            "count": quantity,
-            "client_order_id": str(uuid.uuid4()),
+            "side": v2_side,
+            "count": str(quantity),
+            "price": f"{price:.4f}",
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "maker",
         }
 
-        price_to_send = int(price * 100)
-        if side == "yes":
-            data["yes_price"] = price_to_send
-        else:
-            data["no_price"] = price_to_send
-
-        if expiration_ts is not None:
-            data["expiration_ts"] = expiration_ts
-
         response = self.make_request("POST", path, data=data)
+        # v2 API returns order_id at top level; v1 nested it under "order"
+        if "order_id" in response:
+            return str(response["order_id"])
         return str(response["order"]["order_id"])
 
     def get_market(self, ticker: str) -> Dict:
