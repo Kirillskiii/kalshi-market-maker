@@ -48,6 +48,31 @@ def cancel_resting_orders_for_ticker(
         if remaining:
             logger.error(f"Cleanup incomplete for {ticker}: {len(remaining)} resting orders still present")
             return False
+
+        # Close any open position in this market so it doesn't go unmanaged
+        try:
+            time.sleep(1.0)
+            positions = api.list_all_positions()
+            for p in positions:
+                if p.get("ticker") != ticker:
+                    continue
+                pos = int(float(p.get("position", p.get("position_fp", 0))))
+                if pos == 0:
+                    continue
+                market_data = api.get_market(ticker).get("market", {})
+                if pos > 0:
+                    bid = float(market_data.get("yes_bid_dollars") or market_data.get("yes_bid", 0) / 100)
+                    price = max(0.01, bid - 0.01)
+                    api.place_order_for_ticker(ticker=ticker, action="sell", side="yes", price=price, quantity=pos, expiration_ts=int(time.time()) + 120)
+                    cleanup_logger.warning(f"Closed long position of {pos} on {ticker} @ {price:.2f}")
+                else:
+                    ask = float(market_data.get("yes_ask_dollars") or market_data.get("yes_ask", 0) / 100)
+                    price = min(0.99, ask + 0.01)
+                    api.place_order_for_ticker(ticker=ticker, action="buy", side="yes", price=price, quantity=abs(pos), expiration_ts=int(time.time()) + 120)
+                    cleanup_logger.warning(f"Closed short position of {pos} on {ticker} @ {price:.2f}")
+        except Exception as pos_exception:
+            cleanup_logger.error(f"Position close failed for {ticker}: {pos_exception}")
+
         return True
     except requests.exceptions.RequestException as request_exception:
         logger.error(f"Final cleanup verification failed for {ticker}: {request_exception}")

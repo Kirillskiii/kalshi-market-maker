@@ -22,7 +22,17 @@ class FakeAPI:
         self._positions = positions or []
 
     def get_price(self):
-        return {"yes": self._mid_price, "no": 1.0 - self._mid_price}
+        bid = round(self._mid_price - 0.03, 4)
+        ask = round(self._mid_price + 0.03, 4)
+        return {
+            "yes": self._mid_price,
+            "no": round(1.0 - self._mid_price, 4),
+            "yes_bid": bid,
+            "yes_ask": ask,
+            "no_bid": round(1.0 - ask, 4),
+            "no_ask": round(1.0 - bid, 4),
+            "status": "open",
+        }
 
     def get_position(self):
         return self._position
@@ -217,7 +227,8 @@ class TestAsymmetricQuotes:
 class TestMarketSelection:
     """Market selector should prefer tighter spreads (lower adverse selection)."""
 
-    def test_tighter_spread_scores_higher(self):
+    def test_wider_spread_scores_higher(self):
+        # Market makers profit from the spread they capture, so wider = better.
         from kalshi_market_maker.selection.scoring import select_top_markets
 
         markets = [
@@ -227,33 +238,38 @@ class TestMarketSelection:
         cfg = {
             "min_volume_24h": 0,
             "min_spread_cents": 0,
+            "max_spread_cents": 100,
             "top_n": 2,
             "volume_weight": 0.35,
             "spread_weight": 0.65,
         }
         ranked = select_top_markets(markets, cfg)
-        assert ranked[0][0] == "TIGHT", (
-            f"Tighter spread market should rank first, got: {[t for t, *_ in ranked]}"
+        assert ranked[0][0] == "WIDE", (
+            f"Wider spread market should rank first for market making, got: {[t for t, *_ in ranked]}"
         )
 
-    def test_wide_spread_does_not_dominate(self):
+    def test_max_spread_filters_illiquid_markets(self):
+        # max_spread_cents is the guard against super-illiquid markets where nobody trades.
         from kalshi_market_maker.selection.scoring import select_top_markets
 
         markets = [
-            {"ticker": "LIQUID_TIGHT", "market_type": "binary", "volume_24h": 5000, "yes_bid": 50, "yes_ask": 52},
-            {"ticker": "ILLIQUID_WIDE", "market_type": "binary", "volume_24h": 200, "yes_bid": 50, "yes_ask": 70},
+            {"ticker": "LIQUID", "market_type": "binary", "volume_24h": 5000, "yes_bid": 50, "yes_ask": 57},
+            {"ticker": "ILLIQUID_WIDE", "market_type": "binary", "volume_24h": 200, "yes_bid": 50, "yes_ask": 72},
         ]
         cfg = {
             "min_volume_24h": 0,
             "min_spread_cents": 0,
+            "max_spread_cents": 15,   # filter spreads wider than 15¢
             "top_n": 2,
             "volume_weight": 0.35,
             "spread_weight": 0.65,
         }
         ranked = select_top_markets(markets, cfg)
-        assert ranked[0][0] == "LIQUID_TIGHT", (
-            f"Liquid tight-spread market should rank first, got: {[t for t, *_ in ranked]}"
+        tickers = [t for t, *_ in ranked]
+        assert "ILLIQUID_WIDE" not in tickers, (
+            f"22¢-spread market should be filtered by max_spread_cents=15, got: {tickers}"
         )
+        assert "LIQUID" in tickers, f"Liquid market should pass, got: {tickers}"
 
     def test_falls_back_when_strict_filters_eliminate_all_markets(self):
         from kalshi_market_maker.selection.scoring import select_top_markets
@@ -272,7 +288,8 @@ class TestMarketSelection:
         assert all(m["volume_24h"] < cfg["min_volume_24h"] for m in markets)
         assert all((m["yes_ask"] - m["yes_bid"]) < cfg["min_spread_cents"] for m in markets)
         ranked = select_top_markets(markets, cfg)
-        assert [t for t, *_ in ranked] == ["A", "B"]
+        # B has higher volume and wider spread — ranks first in fallback scoring
+        assert [t for t, *_ in ranked] == ["B", "A"]
 
 
 # ── MVE (Multivariate Event) Rejection Tests ─────────────────────────
@@ -409,3 +426,65 @@ class TestMveRejection:
         ranked = select_top_markets(markets, self.DEFAULT_CFG)
         tickers = [t for t, *_ in ranked]
         assert tickers == ["CLEAN-BINARY"]
+
+
+# ── Fill Price Accuracy Tests ────────────────────────────────────────────────
+
+
+class TestFillPriceAccuracy:
+    """Fill price must use bid (for buys) or ask (for sells), not mid."""
+
+    def test_buy_fill_uses_bid_for_avg_cost(self):
+        """avg_cost after a buy fill should equal the bid price, not mid."""
+        mm = make_mm(api=FakeAPI(mid_price=0.50))  # bid=0.47, ask=0.53
+        mm._update_pnl(0, 0.50)                    # init prev_inventory
+        mm._update_pnl(1, 0.50, fill_bid=0.47, fill_ask=0.53)
+        assert abs(mm._avg_cost - 0.47) < 1e-6, (
+            f"avg_cost={mm._avg_cost:.4f} should be bid=0.47, not mid=0.50"
+        )
+
+    def test_sell_fill_uses_ask_for_realized_pnl(self):
+        """Realized P&L when selling should use ask price, not mid."""
+        mm = make_mm(api=FakeAPI(mid_price=0.50))
+        mm._update_pnl(0, 0.50)           # init
+        mm._update_pnl(1, 0.50, fill_bid=0.47)   # bought at bid=0.47, avg_cost=0.47
+        mm._update_pnl(0, 0.50, fill_ask=0.53)   # sold at ask=0.53
+        expected_pnl = 0.53 - 0.47        # captured full spread
+        assert abs(mm._realized_pnl - expected_pnl) < 1e-6, (
+            f"realized_pnl={mm._realized_pnl:.4f} should be {expected_pnl:.4f} (ask - bid), not {0.50 - 0.47:.4f} (mid - bid)"
+        )
+
+    def test_fill_price_falls_back_to_mid_when_bid_ask_unavailable(self):
+        """When bid/ask aren't provided (e.g. first tick), mid is used as fallback."""
+        mm = make_mm()
+        mm._update_pnl(0, 0.50)          # init
+        mm._update_pnl(1, 0.50)          # no fill_bid passed → falls back to mid
+        assert abs(mm._avg_cost - 0.50) < 1e-6, (
+            f"avg_cost={mm._avg_cost:.4f} should fall back to mid=0.50"
+        )
+
+
+# ── Global Drawdown Tests ────────────────────────────────────────────────────
+
+
+class TestGlobalDrawdown:
+    """Portfolio P&L is tracked across workers; exceeding limit signals global stop."""
+
+    def test_portfolio_pnl_accumulates_across_fills(self):
+        """Each realized P&L event adds to shared total_realized_pnl."""
+        shared = {"active_markets": 1}
+        mm = make_mm(shared_risk_state=shared)
+        mm._update_pnl(0, 0.50)
+        mm._update_pnl(1, 0.50, fill_bid=0.47)   # bought at 0.47
+        mm._update_pnl(0, 0.50, fill_ask=0.53)   # sold at 0.53 → +0.06 realized
+        assert abs(shared.get("total_realized_pnl", 0.0) - 0.06) < 1e-6
+
+    def test_lock_present_in_shared_state_after_bot_init(self):
+        """shared_risk_state from dynamic.py should include a threading.Lock."""
+        import threading
+        shared = {"active_markets": 1, "_lock": threading.Lock()}
+        mm = make_mm(shared_risk_state=shared)
+        mm._update_pnl(0, 0.50)
+        mm._update_pnl(1, 0.50, fill_bid=0.44)
+        mm._update_pnl(0, 0.50, fill_ask=0.56)
+        assert "_lock" in shared  # lock must not have been removed

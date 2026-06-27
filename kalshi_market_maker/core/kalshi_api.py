@@ -76,6 +76,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
         url = f"{self.base_url}{path}"
         parsed_path = urlparse(url).path
         retryable_codes = {429, 500, 502, 503, 504}
+        # 4xx errors (except 429) are client mistakes — retrying won't help
+        non_retryable_codes = {400, 401, 403, 404, 409, 410, 422}
 
         for attempt in range(max_retries + 1):
             headers = self.get_headers(method, parsed_path)
@@ -110,19 +112,25 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as request_exception:
-                if attempt < max_retries:
-                    backoff = 0.5 * (2**attempt) + random.uniform(0, 0.25)
-                    self.logger.warning(
-                        f"Request exception for {method} {path}: {request_exception}. Retrying in {backoff:.2f}s "
-                        f"(attempt {attempt + 1}/{max_retries})"
-                    )
-                    time.sleep(backoff)
-                    continue
+                status_code = (
+                    request_exception.response.status_code
+                    if hasattr(request_exception, "response") and request_exception.response is not None
+                    else None
+                )
+                if status_code in non_retryable_codes or attempt >= max_retries:
+                    if status_code not in non_retryable_codes:
+                        # only log terminal failures for server errors — callers handle 4xx themselves
+                        self.logger.error(f"Request failed: {request_exception}")
+                        if request_exception.response is not None:
+                            self.logger.error(f"Response content: {request_exception.response.text}")
+                    raise
 
-                self.logger.error(f"Request failed: {request_exception}")
-                if hasattr(request_exception, "response") and request_exception.response is not None:
-                    self.logger.error(f"Response content: {request_exception.response.text}")
-                raise
+                backoff = 0.5 * (2**attempt) + random.uniform(0, 0.25)
+                self.logger.warning(
+                    f"Request exception for {method} {path}: {request_exception}. Retrying in {backoff:.2f}s "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                time.sleep(backoff)
 
     def get_position(self) -> int:
         path = "/portfolio/positions"
@@ -158,7 +166,15 @@ class KalshiTradingAPI(AbstractTradingAPI):
         yes_mid_price = round((yes_bid + yes_ask) / 2, 4)
         no_mid_price = round((no_bid + no_ask) / 2, 4)
 
-        return {"yes": yes_mid_price, "no": no_mid_price}
+        return {
+            "yes": yes_mid_price,
+            "no": no_mid_price,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+            "status": market.get("status", "open"),
+        }
 
     def place_order(self, action: str, side: str, price: float, quantity: int, expiration_ts: int = None) -> str:
         return self.place_order_for_ticker(
@@ -189,11 +205,15 @@ class KalshiTradingAPI(AbstractTradingAPI):
             v2_side = "ask" if action.lower() == "buy" else "bid"
             price = 1.0 - price  # convert no-price to yes-price
 
+        # Kalshi prices must be whole cents (0.01–0.99); sub-cent values are rejected as invalid_price
+        price_cents = max(1, min(99, round(price * 100)))
+        price = price_cents / 100.0
+
         data = {
             "ticker": ticker,
             "side": v2_side,
             "count": str(quantity),
-            "price": f"{price:.4f}",
+            "price": f"{price:.2f}",
             "time_in_force": "good_till_canceled",
             "self_trade_prevention_type": "maker",
         }
@@ -240,9 +260,29 @@ class KalshiTradingAPI(AbstractTradingAPI):
         return positions
 
     def cancel_order(self, order_id: int) -> bool:
-        path = f"/portfolio/orders/{order_id}"
-        response = self.make_request("DELETE", path)
-        return response["reduced_by"] > 0
+        # v2 cancel: DELETE /portfolio/events/orders/{id}  (same root as create)
+        # v1 GET for status check: GET /portfolio/orders/{id}  (read-only, still works)
+        cancel_path = f"/portfolio/events/orders/{order_id}"
+        status_path = f"/portfolio/orders/{order_id}"
+        try:
+            response = self.make_request("DELETE", cancel_path)
+            return int(float(response.get("reduced_by", 0))) > 0
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 410:
+                # 410 has two meanings: order truly gone (filled/cancelled), OR
+                # trading is paused for that market right now (Kalshi also returns 410
+                # for cancellation attempts on paused markets). Verify which it is.
+                try:
+                    order_data = self.make_request("GET", status_path)
+                    order = order_data.get("order", order_data)
+                    status = order.get("status", "")
+                    if status in ("cancelled", "canceled", "filled", "settlement"):
+                        return True  # genuinely done — nothing to cancel
+                    # still resting but market is paused — signal that we couldn't cancel
+                    return False
+                except Exception:
+                    return True  # can't GET the order either — assume it's gone
+            raise
 
     def get_orders(self, ticker: Optional[str] = None, status: str = "resting") -> List[Dict]:
         path = "/portfolio/orders"

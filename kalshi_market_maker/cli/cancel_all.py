@@ -158,6 +158,7 @@ def main():
                 logger.warning(f"Round {round_index}: canceling {len(round_resting_orders)} resting orders before flattening")
                 cancel_order_batch(api, round_resting_orders, logger, args.dry_run)
 
+            time.sleep(3.0)  # wait for Kalshi API to reflect cancelled orders before checking positions
             positions = api.list_all_positions()
             liquidation_candidates = []
 
@@ -178,20 +179,24 @@ def main():
                 if signed_position > 0:
                     action = "sell"
                     side = "yes"
-                    best_bid = market_data.get("yes_bid")
-                    if best_bid is None:
+                    if "yes_bid_dollars" in market_data:
+                        price_cents = max(1, round(float(market_data["yes_bid_dollars"]) * 100) - price_offset_cents)
+                    elif market_data.get("yes_bid") is not None:
+                        price_cents = max(1, int(market_data["yes_bid"]) - price_offset_cents)
+                    else:
                         logger.error(f"Skipping liquidation for {ticker}: missing yes_bid")
                         continue
-                    price_cents = max(1, int(best_bid) - price_offset_cents)
                     quantity = signed_position
                 else:
                     action = "buy"
                     side = "yes"
-                    best_ask = market_data.get("yes_ask")
-                    if best_ask is None:
+                    if "yes_ask_dollars" in market_data:
+                        price_cents = min(99, round(float(market_data["yes_ask_dollars"]) * 100) + price_offset_cents)
+                    elif market_data.get("yes_ask") is not None:
+                        price_cents = min(99, int(market_data["yes_ask"]) + price_offset_cents)
+                    else:
                         logger.error(f"Skipping liquidation for {ticker}: missing yes_ask")
                         continue
-                    price_cents = min(99, int(best_ask) + price_offset_cents)
                     quantity = abs(signed_position)
 
                 liquidation_candidates.append(

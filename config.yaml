@@ -2,31 +2,89 @@ dynamic:
   log_level: INFO
   risk:
     max_global_contracts: 1000
-    max_contracts_per_market: 200
+    max_contracts_per_market: 4
     reserve_contracts_buffer: 10
+    global_drawdown_limit: 1.00  # stop ALL trading if total realized P&L drops below -$1.00 in a session
   market_selector:
-    top_n: 5
-    refresh_seconds: 45
+    top_n: 4
+    refresh_seconds: 14400
+    orphan_check_seconds: 9999  # temporarily disabled — manual orders on unmanaged tickers
     worker_shutdown_timeout_seconds: 15
-    min_volume_24h: 500
+    min_volume_24h: 50
     min_spread_cents: 2
-    volume_weight: 0.35
-    spread_weight: 0.65
+    max_spread_cents: 15        # skip illiquid markets — too wide means nobody trades there
+    min_hours_to_close: 360     # 15 days minimum — long-term markets only, less adverse selection
+    min_mid_price: 0.10
+    max_mid_price: 0.80
+    volume_weight: 0.60
+    spread_weight: 0.40
     mve_filter: exclude
+    # Allowlist: only trade these series. Empty list = trade everything (not recommended).
+    # Add a series ticker prefix to allow it; anything not listed is blocked.
+    allowed_series:
+      # Active non-sports markets (live account, June 2026)
+      - KXTEMPNYCH        # NYC daily temperature — weather, settles cleanly
+      - KXNATGASD         # Natural gas daily close price
+      - KXAAAGASD         # AAA average gas price
+      - KXTRUMPMENTION    # Presidential statements
+      - KXTRUMPMENTIONB
+      - KXHOCHULMENTION   # NY Governor statements
+      - KXPSAKIMENTION
+      - KXNUA             # Nu Holdings company metrics
+      - KXNU
+      - KXALBUMEQUIV      # Album equivalent sales
+      - KXIPO             # IPO markets
+      - KXINXDUD          # S&P 500 daily level (demo)
+      - KXNASDAQDUD       # Nasdaq-100 daily level (demo)
+      # Economic series — appear near event dates
+      - KXFED             # Federal Reserve rate decisions
+      - KXCPI             # CPI inflation releases
+      - KXJOBS            # Jobs report
+      - KXUNEMP           # Unemployment rate
+      - KXGDP             # GDP releases
+      - KXPCE             # PCE inflation
+      - KXELECTION        # Election markets
+      - KXBTC             # Bitcoin price markets
+      - KXBTCD            # Bitcoin daily close
+      - KXETH             # Ethereum price
+      - KXETHD            # Ethereum daily close
     page_limit: 250
     max_pages: 5
     max_markets: 1250
+    # These series are fetched directly on every scan cycle (avoids the 1250-market pagination cap)
+    targeted_series:
+      - KXBTCD
+      - KXBTC
+      - KXETHD
+      - KXETH
+      - KXFED
+      - KXCPI
+      - KXJOBS
+      - KXAAAGASD
+      - KXNATGASD
+      - KXTEMPNYCH
+      - KXTRUMPMENTION
+      - KXTRUMPMENTIONB
+      - KXHOCHULMENTION
     # series_ticker: "FED"
   market_maker:
-    target_order_dollars: 1.0
-    max_position: 200
-    order_expiration: 3600
-    gamma: 0.2
+    target_order_dollars: 0.25
+    max_exposure_dollars: 1.0
+    max_position: 2
+    order_expiration: 60
+    gamma: 0.5
     k: 150.0
-    sigma: 0.10
-    T: 28800
-    min_spread: 0.03
+    sigma: 0.15
+    T: 2592000  # 30 days — effectively no time limit
+    min_spread: 0.04            # floor must cover Kalshi fees (~2¢/side) with margin
     position_limit_buffer: 0.05
     inventory_skew_factor: 0.001
     trade_side: "yes"
-  dt: 5.0
+    stop_loss_dollars: 0.50     # exit market if total P&L on this ticker drops below -$0.50
+    consecutive_fill_threshold: 3  # pause a side after 3+ contracts fill in a row on that side
+    drift_window: 15            # ticks used to estimate realized vol and OFI fallback momentum
+    adverse_selection_window: 20   # rolling fill window for adverse selection rate (widens spread when high)
+    price_spike_threshold: 0.05   # mid price jump ≥5¢ in one tick triggers a news-event pause
+    price_spike_pause_ticks: 10   # ticks to cancel all orders and wait after a spike (10×3s = 30s)
+    kalshi_fee_rate: 0.07         # Kalshi fee = 7% × P × (1−P) per contract per side; sets dynamic spread floor
+  dt: 3.0

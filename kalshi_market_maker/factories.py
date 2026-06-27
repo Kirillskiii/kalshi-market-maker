@@ -20,7 +20,14 @@ def create_api(api_config: Dict, logger, market_ticker: str | None = None) -> Ka
     )
 
 
-def create_market_maker(mm_config: Dict, api, logger, risk_config: Dict | None = None, shared_risk_state: Dict | None = None) -> AvellanedaMarketMaker:
+def create_market_maker(
+    mm_config: Dict,
+    api,
+    logger,
+    risk_config: Dict | None = None,
+    shared_risk_state: Dict | None = None,
+    close_time: float | None = None,
+) -> AvellanedaMarketMaker:
     risk_config = risk_config or {}
 
     return AvellanedaMarketMaker(
@@ -41,4 +48,14 @@ def create_market_maker(mm_config: Dict, api, logger, risk_config: Dict | None =
         reserve_contracts_buffer=risk_config.get("reserve_contracts_buffer", 0),
         shared_risk_state=shared_risk_state,
         target_order_dollars=mm_config.get("target_order_dollars"),
+        max_exposure_dollars=mm_config.get("max_exposure_dollars"),
+        stop_loss_dollars=mm_config.get("stop_loss_dollars"),
+        consecutive_fill_threshold=int(mm_config.get("consecutive_fill_threshold", 3)),
+        drift_window=int(mm_config.get("drift_window", 15)),
+        adverse_selection_window=int(mm_config.get("adverse_selection_window", 20)),
+        price_spike_threshold=float(mm_config.get("price_spike_threshold", 0.05)),
+        price_spike_pause_ticks=int(mm_config.get("price_spike_pause_ticks", 10)),
+        close_time=close_time,
+        global_drawdown_limit=risk_config.get("global_drawdown_limit"),
+        kalshi_fee_rate=float(mm_config.get("kalshi_fee_rate", 0.07)),
     )

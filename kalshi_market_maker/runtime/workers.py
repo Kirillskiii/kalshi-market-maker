@@ -1,8 +1,10 @@
+from datetime import datetime, timezone
 from typing import Dict
 import threading
 
 from ..factories import create_api, create_market_maker
 from ..logging_utils import build_logger
+from ..selection.scoring import ticker_event_date
 
 
 def _is_unsupported_market(ticker: str, market_data: Dict) -> bool:
@@ -64,19 +66,38 @@ def run_market_worker(
         api.logout()
         return
 
+    # Determine the effective close time for proximity-factor spread widening.
+    # Use the earliest of: API close_time, API expiration_time, and the date
+    # embedded in the ticker (more reliable for Kalshi daily event markets).
+    close_time: float | None = None
+    for field in ("close_time", "expiration_time"):
+        ts = market_data.get(field)
+        if ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                t = dt.timestamp()
+                if close_time is None or t < close_time:
+                    close_time = t
+            except (ValueError, TypeError):
+                pass
+    event_dt = ticker_event_date(ticker)
+    if event_dt is not None:
+        event_ts = event_dt.timestamp()
+        if close_time is None or event_ts < close_time:
+            close_time = event_ts
+
     market_maker = create_market_maker(
         dynamic_config.get("market_maker", {}),
         api,
         logger,
         dynamic_config.get("risk", {}),
         shared_risk_state,
+        close_time=close_time,
     )
     dt = dynamic_config.get("dt", 2.0)
 
     try:
         logger.info(f"Starting market maker worker for {ticker}")
         market_maker.run(dt, stop_event=stop_event)
-    except Exception as worker_exception:
-        logger.error(f"Worker failed for {ticker}: {worker_exception}")
     finally:
-        api.logout()
+        api.logout()  # always clean up, whether normal exit or crash
